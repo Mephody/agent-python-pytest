@@ -24,7 +24,7 @@ except pkg_resources.VersionConflict:
 from _pytest.python import Class, Function, Instance, Module
 from _pytest.unittest import TestCaseFunction, UnitTestCase
 
-from reportportal_client import ReportPortalServiceAsync
+from reportportal_client import ReportPortalService
 from six import with_metaclass
 from six.moves import queue
 
@@ -75,11 +75,14 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
 
     def __init__(self):
         self.RP = None
+        self.rp_supports_parameters = True
         try:
             pkg_resources.get_distribution('reportportal_client >= 3.2.0')
-            self.RP_SUPPORTS_PARAMETERS = True
         except pkg_resources.VersionConflict:
-            self.RP_SUPPORTS_PARAMETERS = False
+            self.rp_supports_parameters = False
+
+        self.log_item_id = None
+        self.parent_item_id = None
 
         self.ignore_errors = True
         self.ignored_tags = []
@@ -95,23 +98,21 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
         self._errors = queue.Queue()
         if self.RP is None:
             self.ignore_errors = ignore_errors
-            if self.RP_SUPPORTS_PARAMETERS:
+            if self.rp_supports_parameters:
                 self.ignored_tags = list(set(ignored_tags).union({'parametrize'}))
             else:
                 self.ignored_tags = ignored_tags
             log.debug('ReportPortal - Init service: endpoint=%s, '
                       'project=%s, uuid=%s', endpoint, project, uuid)
-            self.RP = ReportPortalServiceAsync(
+            self.RP = ReportPortalService(
                 endpoint=endpoint,
                 project=project,
                 token=uuid,
-                error_handler=self.async_error_handler,
                 retries=retries,
-                log_batch_size=log_batch_size,
                 verify_ssl=verify_ssl
             )
-            if self.RP and hasattr(self.RP.rp_client, "get_project_settings"):
-                self.project_settings = self.RP.rp_client.get_project_settings()
+            if self.RP and hasattr(self.RP, "get_project_settings"):
+                self.project_settings = self.RP.get_project_settings()
             else:
                 self.project_settings = None
             self.issue_types = self.get_issue_types()
@@ -120,19 +121,14 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
         return self.RP
 
     def async_error_handler(self, exc_info):
-        self.terminate_service(nowait=True)
         self.RP = None
         self._errors.put_nowait(exc_info)
 
-    def terminate_service(self, nowait=False):
-        if self.RP is not None:
-            self.RP.terminate(nowait)
-            self.RP = None
-
-    def start_launch(self, launch_name,
+    def start_launch(self,
+                     launch_name,
                      mode=None,
-                     tags=None,
-                     description=None):
+                     description=None,
+                     **kwargs):
         self._stop_if_necessary()
         if self.RP is None:
             return
@@ -142,11 +138,11 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
             'start_time': timestamp(),
             'description': description,
             'mode': mode,
-            'tags': tags
         }
         log.debug('ReportPortal - Start launch: equest_body=%s', sl_pt)
-        req_data = self.RP.start_launch(**sl_pt)
-        log.debug('ReportPortal - Launch started: response_body=%s', req_data)
+        item_id = self.RP.start_launch(**sl_pt)
+        log.debug('ReportPortal - Launch started: id=%s', item_id)
+        return item_id
 
     def collect_tests(self, session):
         self._stop_if_necessary()
@@ -220,25 +216,30 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
             payload = {
                 'name': self._get_item_name(part),
                 'description': self._get_item_description(part),
-                'tags': self._get_item_tags(part),
                 'start_time': timestamp(),
-                'item_type': 'SUITE'
+                'item_type': 'SUITE',
+                'parent_item_id': self.parent_item_id
             }
             log.debug('ReportPortal - Start Suite: request_body=%s', payload)
-            self.RP.start_test_item(**payload)
+            item_id = self.RP.start_test_item(**payload)
+            self.log_item_id = item_id
+            self.parent_item_id = item_id
+            self._hier_parts[part]["item_id"] = item_id
 
         start_rq = {
             'name': self._get_item_name(test_item),
             'description': self._get_item_description(test_item),
-            'tags': self._get_item_tags(test_item),
             'start_time': timestamp(),
-            'item_type': 'STEP'
+            'item_type': 'TEST',
+            'parent_item_id': self.parent_item_id
         }
-        if self.RP_SUPPORTS_PARAMETERS:
+        if self.rp_supports_parameters:
             start_rq['parameters'] = self._get_parameters(test_item)
 
         log.debug('ReportPortal - Start TestItem: request_body=%s', start_rq)
-        self.RP.start_test_item(**start_rq)
+        item_id = self.RP.start_test_item(**start_rq)
+        self.log_item_id = item_id
+        return item_id
 
     def is_item_update_supported(self):
         """Check item update API call client support."""
@@ -265,7 +266,7 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
         log.debug('ReportPortal - Update TestItem: request_body=%s', start_rq)
         self.RP.update_test_item(**start_rq)
 
-    def finish_pytest_item(self, test_item, status, issue=None):
+    def finish_pytest_item(self, test_item, item_id, status, issue=None):
         self._stop_if_necessary()
         if self.RP is None:
             return
@@ -273,7 +274,8 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
         fta_rq = {
             'end_time': timestamp(),
             'status': status,
-            'issue': issue
+            'issue': issue,
+            'item_id': item_id
         }
 
         log.debug('ReportPortal - Finish TestItem: request_body=%s', fta_rq)
@@ -290,12 +292,13 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
             payload = {
                 'end_time': timestamp(),
                 'issue': issue,
+                'item_id': self._hier_parts[part]["item_id"],
                 'status': part._rp_result
             }
             log.debug('ReportPortal - End TestSuite: request_body=%s', payload)
             self.RP.finish_test_item(**payload)
 
-    def finish_launch(self, status='rp_launch', force=False):
+    def finish_launch(self, status=None, **kwargs):
         self._stop_if_necessary()
         if self.RP is None:
             return
@@ -306,10 +309,7 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
             'status': status
         }
         log.debug('ReportPortal - Finish launch: request_body=%s', fl_rq)
-        if not force:
-            self.RP.finish_launch(**fl_rq)
-        else:
-            self.RP.stop_launch(**fl_rq)
+        self.RP.finish_launch(**fl_rq)
 
     def post_log(self, message, loglevel='INFO', attachment=None):
         self._stop_if_necessary()
@@ -327,7 +327,7 @@ class PyTestServiceClass(with_metaclass(Singleton, object)):
             'level': loglevel,
             'attachment': attachment,
         }
-        self.RP.log(**sl_rq)
+        self.RP.log_batch((sl_rq,), item_id=self.log_item_id)
 
     def _stop_if_necessary(self):
         try:

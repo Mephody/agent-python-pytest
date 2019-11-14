@@ -59,7 +59,7 @@ def pytest_sessionstart(session):
             description=session.config.option.rp_launch_description
         )
         if session.config.pluginmanager.hasplugin('xdist'):
-            wait_launch(session.config.py_test_service.RP.rp_client)
+            wait_launch(session.config.py_test_service.RP)
 
 
 @pytest.hookimpl(trylast=True)
@@ -101,14 +101,8 @@ def pytest_sessionfinish(session):
         # Stop now if the plugin is not properly configured
         return
 
-    shouldfail = getattr(session, 'shouldfail', False)
-    nowait = True if shouldfail else False
-
     if is_master(session.config):
-        session.config.py_test_service.finish_launch(
-            status='RP_Launch', force=nowait)
-
-    session.config.py_test_service.terminate_service(nowait=nowait)
+        session.config.py_test_service.finish_launch()
 
 
 def pytest_configure(config):
@@ -151,8 +145,8 @@ def pytest_configure(config):
     if is_master(config):
         config.py_test_service = PyTestServiceClass()
     else:
-        config.py_test_service = pickle.loads(config.slaveinput['py_test_service'])
-        config.py_test_service.RP.listener.start()
+         config.py_test_service = pickle.loads(config.slaveinput['py_test_service'])
+         # config.py_test_service.RP.listener.start()
 
     # set Pytest_Reporter and configure it
     if PYTEST_HAS_LOGGING_PLUGIN:
